@@ -1,0 +1,11 @@
+curl -X POST "http://localhost:8000/tasks" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "mode": "SYNC",
+           "payload": {
+             "action": "process_model",
+             "file_id": "550e8400-e29b-41d4-a716-446655440000"
+           },
+           "retry": 3,
+           "timeout": 10
+         }'
