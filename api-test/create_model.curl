@@ -1,0 +1,6 @@
+curl -X POST "http://localhost:8000/models" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "name": "llama-3-custom",
+           "framework": "PyTorch"
+         }'
