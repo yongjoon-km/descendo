@@ -1,2 +1,2 @@
-curl -X POST "http://localhost:8000/models/e18103a6-66cd-4b82-b906-3be07fdd7021/upload" \
+curl -X POST "http://localhost:8000/models/1/upload" \
      -F "file=@dummy_model.pte"

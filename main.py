@@ -1,12 +1,83 @@
-import asyncio
+import concurrent
+import json
+import time
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Dict
-import uuid
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, UploadFile
+from typing import Annotated, Any
+
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
+from sqlalchemy import func
+from sqlmodel import SQLModel, Field as SQLField, Session, create_engine, select
+
+# ===
+# Database Models
+# ===
+
+class ModelStatus(StrEnum):
+    PENDING_UPLOAD = 'PENDING_UPLOAD'
+    UPLOADING = 'UPLOADING'
+    UPLOADED = 'UPLOADED'
+
+
+
+class Model(SQLModel, table=True):
+    id: int | None = SQLField(primary_key=True)
+    name: str = SQLField()
+    framework: str = SQLField()
+    status: ModelStatus = SQLField()
+    file_path: str | None = SQLField()
+
+class TaskMode(StrEnum):
+    SYNC = 'SYNC'
+    ASYNC = 'ASYNC'
+
+
+class TaskStatus(StrEnum):
+    PENDING = 'PENDING'
+    RUNNING = 'RUNNING'
+    COMPLETED = 'COMPLETED'
+    FAILED = 'FAILED'
+    CANCELLED = 'CANCELLED'
+
+
+class TaskConfig(BaseModel):
+    retry: int
+    timeout_sec: int
+
+
+class Task(SQLModel, table=True):
+    id: int | None = SQLField(primary_key=True)
+    mode: TaskMode = SQLField()
+    status: TaskStatus = SQLField()
+    model_id: int = SQLField()
+    payload: str = SQLField()
+    config: str = SQLField()
+    result: str | None= SQLField()
+
+
+sqlite_file_name = "database.db"
+sqlite_url = f"sqlite:///{sqlite_file_name}"
+
+connect_args = {"check_same_thread": False}
+engine = create_engine(sqlite_url, connect_args = connect_args)
+
+def create_db_and_tables():
+    SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+SessionDep = Annotated[Session, Depends(get_session)]
+
+
 app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
 
 
 # ===
@@ -17,55 +88,64 @@ app = FastAPI()
 MODEL_DIR = Path("saved_models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-# Temporary db. In production, we might use RDB.
-models_db = {}
-
-class ModelMetadata(BaseModel):
+class CreateModelRequest(BaseModel):
     name: str
     framework: str
 
-class ModelStatus(StrEnum):
-    PENDING_UPLOAD = 'PENDING_UPLOAD'
-    UPLOADING = 'UPLOADING'
-    UPLOADED = 'UPLOADED'
+class CreateModelResponse(BaseModel):
+    message: str
+    model_id: int
+    upload_url: str
 
-@app.post("/models")
-def create_model(metadata: ModelMetadata):
-    model_id = str(uuid.uuid4())
+class ReadModelsResponse(BaseModel):
+    total_count: int
+    skip: int
+    limit: int
+    data: list[Model]
 
-    models_db[model_id] = {
-        "id": model_id,
-        "name": metadata.name,
-        "framework": metadata.framework,
-        "status": ModelStatus.PENDING_UPLOAD,
-        "file_path": None
-    }
+
+@app.post("/models", response_model=CreateModelResponse)
+def create_model(metadata: CreateModelRequest, session: SessionDep):
+    model = Model(
+        id=None,
+        name=metadata.name,
+        framework=metadata.framework,
+        status=ModelStatus.PENDING_UPLOAD,
+        file_path=None
+    )
+    session.add(model)
+    session.commit()
+    session.refresh(model)
+
     return {
         "message": "Metadata created successfully.",
-        "model_id": model_id,
-        "upload_url": f"/models/{model_id}/upload",
+        "model_id": model.id,
+        "upload_url": f"/models/{model.id}/upload",
     }
 
 @app.post("/models/{model_id}/upload")
-async def upload_model(model_id: str, file: UploadFile):
-    if model_id not in models_db:
+async def upload_model(session: SessionDep, model_id: str, file: UploadFile):
+    model = session.get(Model, model_id)
+    if not model:
         raise HTTPException(status_code=404, detail="Model ID not found. Create metadata first")
-    if models_db[model_id]["status"] == ModelStatus.UPLOADING:
+    if model.status == ModelStatus.UPLOADING:
         raise HTTPException(status_code=400, detail="A file is uploadeding")
-    if models_db[model_id]["status"] == ModelStatus.UPLOADED:
+    if model.status == ModelStatus.UPLOADED:
         raise HTTPException(status_code=400, detail="A file has already been uploaded")
 
     file_extension = Path(file.filename if file.filename else "").suffix
     destination_path = MODEL_DIR / f"{model_id}{file_extension}"
-    models_db[model_id]["status"] = ModelStatus.UPLOADING
+    model.status = ModelStatus.UPLOADING
+    session.commit()
 
     try:
         with destination_path.open("wb") as buffer:
             while chunk := await file.read(1024 * 1024):
                 _ = buffer.write(chunk)
 
-        models_db[model_id]["status"] = ModelStatus.UPLOADED
-        models_db[model_id]["file_path"] = str(destination_path)
+        model.status = ModelStatus.UPLOADED
+        model.file_path = str(destination_path)
+        session.commit()
 
     except Exception as e:
         if destination_path.exists():
@@ -79,150 +159,147 @@ async def upload_model(model_id: str, file: UploadFile):
         "message": "Model uploaded successfully",
     }
 
-@app.get("/models")
+@app.get("/models", response_model=ReadModelsResponse)
 def read_models(
+    session: SessionDep,
     skip: Annotated[int, Query(description="How many records to skip (offset)", ge=0)] = 0,
     limit: Annotated[int, Query(description="How many records to return (Max 100)", ge=1, le=100)] = 10
 ):
-    all_models = list(models_db.values())
+    query = select(Model).offset(skip).limit(limit).order_by(Model.id)
+    models = session.exec(query).all()
+    total_count = session.scalar(select(func.count()).select_from(Model))
 
-    total_count = len(all_models)
-
-    paginated_models = all_models[skip : skip + limit]
 
     return {
-        "total": total_count,
+        "total_count": total_count,
         "skip": skip,
         "limit": limit,
-        "data": paginated_models,
+        "data": list(models),
     }
 
-@app.get("/models/{model_id}")
-def read_model(model_id: str):
-    if model_id not in models_db:
+@app.get("/models/{model_id}", response_model=Model)
+def read_model(session: SessionDep, model_id: str):
+    model = session.get(Model, model_id)
+    if not model:
         raise HTTPException(status_code=400, detail=f"Model of {model_id} not found")
-    model = models_db[model_id]
 
-    return {
-        "id": model_id,
-        "name": model["name"],
-        "framework": model["framework"],
-        "status": model["status"].value,
-        "file_path": model["file_path"]
-    }
+    return model
 
 # ===
 # Task APIs
 # ===
 
-tasks_db = {}
-
-class TaskMode(StrEnum):
-    SYNC = 'SYNC'
-    ASYNC = 'ASYNC'
-
-
-class TaskState(StrEnum):
-    PENDING = 'PENDING'
-    RUNNING = 'RUNNING'
-    COMPLETED = 'COMPLETED'
-    FAILED = 'FAILED'
-    CANCELLED = 'CANCELLED'
-
-
 class TaskRequest(BaseModel):
     mode: TaskMode = Field(default=TaskMode.ASYNC, description="async / sync mode of executing the given task")
+    model_id: int = Field(..., description="model id for running the task")
     payload: dict[str, Any] = Field(..., description="data required for the given task")
     retry: int = Field(default=3, ge=0, description="retry count if given task failed")
     timeout_sec: int = Field(default=5, gt=0, description="timeout second for waiting the task is completed")
 
 class TaskResponse(BaseModel):
-    task_id: str
-    status: TaskState
+    id: int
+    status: TaskStatus
     result: Any | None = None
 
-async def dummy_executor(task_id: str):
-    if tasks_db[task_id]["status"] == TaskState.CANCELLED:
+
+def dummy_executor(session: Session, task_id: int):
+    task = session.get(Task, task_id)
+
+    if task is None:
+        raise Exception(f"task of {task_id} not found")
+
+    if task.status == TaskStatus.CANCELLED:
         return
 
-    tasks_db[task_id]["status"] = TaskState.RUNNING
+    task.status = TaskStatus.RUNNING
+    session.commit()
 
-    await asyncio.sleep(3)
+    time.sleep(3)
 
-    if tasks_db[task_id]["status"] == TaskState.CANCELLED:
-        return
-
-    tasks_db[task_id]["status"] = TaskState.COMPLETED
-    tasks_db[task_id]["result"] = {"message": "Task finished successfully!"}
+    task.status = TaskStatus.COMPLETED
+    task.result = json.dumps({"message": "Task finished successfully!"})
+    session.commit()
 
 
 @app.post("/tasks", response_model=TaskResponse)
-async def create_task(request: TaskRequest, background_tasks: BackgroundTasks):
-    task_id = str(uuid.uuid4())
+def create_task(session: SessionDep, request: TaskRequest):
+    task = Task(
+        id=None,
+        mode=request.mode,
+        status=TaskStatus.PENDING,
+        model_id=request.model_id,
+        payload=json.dumps(request.payload),
+        config=TaskConfig(retry=request.retry, timeout_sec=request.timeout_sec).model_dump_json(),
+        result=None
+    )
+    
+    session.add(task)
+    session.commit()      # 1. Commit FIRST to save the row and generate the ID
+    session.refresh(task) # 2. Refresh to load the new ID into the Python object
+    assert task.id is not None
+    
+    config = TaskConfig.model_validate_json(task.config)
 
-    tasks_db[task_id] = {
-        "task_id": task_id,
-        "status": TaskState.PENDING,
-        "payload": request.payload,
-        "config": {"retry": request.retry, "timeout_sec": request.timeout_sec},
-        "result": None
-    }
-
-    if  request.mode == TaskMode.SYNC:
-        max_attempts = request.retry + 1
+    if task.mode == TaskMode.SYNC:
+        max_attempts = config.retry + 1
         
         for attempt in range(max_attempts):
             try:
-                # We reset the status to RUNNING for each new attempt
-                tasks_db[task_id]["status"] = TaskState.RUNNING
-                
-                # Execute with the timeout applied to *this specific attempt*
-                await asyncio.wait_for(dummy_executor(task_id), timeout=request.timeout_sec)
-                
-                # If it finishes successfully without throwing an error, we break the loop
-                if tasks_db[task_id]["status"] == TaskState.COMPLETED:
-                    break
+                # Execute the sync function inside a thread to enforce a timeout
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    # TODO: Change to real executor
+                    future = executor.submit(dummy_executor, session, task.id)
                     
-            except asyncio.TimeoutError:
-                # If it times out, and we are out of retries, mark as FAILED
-                if attempt == request.retry:
-                    tasks_db[task_id]["status"] = TaskState.FAILED
-                    tasks_db[task_id]["result"] = {
-                        "error": f"Task timed out after {request.timeout_sec}s on final attempt ({max_attempts}/{max_attempts})."
-                    }
+                    # This blocks until it finishes OR hits the timeout_sec
+                    future.result(timeout=config.timeout_sec)
+                    
+                # If we reach here without exceptions, it succeeded. Break the loop.
+                break 
+                
+            except concurrent.futures.TimeoutError:
+                # If it times out, check if we are out of retries
+                if attempt == config.retry:
+                    task.status = TaskStatus.FAILED
+                    task.result = json.dumps({
+                        "error": f"Task timed out after {config.timeout_sec}s on final attempt ({max_attempts}/{max_attempts})."
+                    })
+                    session.commit()
                     
             except Exception as e:
                 # Catch any other execution errors (like DB disconnects, math errors)
-                if attempt == request.retry:
-                    tasks_db[task_id]["status"] = TaskState.FAILED
-                    tasks_db[task_id]["result"] = {
+                if attempt == config.retry:
+                    task.status = TaskStatus.FAILED
+                    task.result = json.dumps({
                         "error": f"Task failed on final attempt: {str(e)}"
-                    }
+                    })
+                    session.commit()
                 else:
-                    # Optional: Add a small delay between retries so you don't hammer the system
-                    await asyncio.sleep(1)
+                    # Synchronous sleep before retrying
+                    time.sleep(1)
 
-        return tasks_db[task_id]
+        return task
 
     else:
-        background_tasks.add_task(dummy_executor, task_id)
-        return tasks_db[task_id]
+        return task
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse)
-def read_task(task_id: str):
-    if task_id not in tasks_db:
+def read_task(session: SessionDep, task_id: int):
+    task = session.get(Task, task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return tasks_db[task_id]
+    return task
 
 @app.post("/tasks/{task_id}/cancel")
-def cancel_task(task_id: str):
-    if task_id not in tasks_db:
+def cancel_task(session: SessionDep, task_id: int):
+    task = session.get(Task, task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    current_status = tasks_db[task_id]["status"]
+    current_status = task.status
 
-    if current_status in [TaskState.COMPLETED, TaskState.FAILED]:
+    if current_status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         raise HTTPException(status_code=400, detail=f"Cannot cancel a task in {current_status} state")
 
-    tasks_db[task_id]["status"] = TaskState.CANCELLED
+    task.status = TaskStatus.CANCELLED
+    session.commit()
     return {"message": "Task cancellation requested", "task_id": task_id}
