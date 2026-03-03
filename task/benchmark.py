@@ -24,8 +24,6 @@ def benchmark_model(
     num_runs: int = 100,
     warmup_runs: int = 10,
 ) -> Benchmark:
-    pytorch_model.eval()
-
     sample_input = (torch.randn(input_shape),)
 
     exported_program = torch.export.export(pytorch_model, sample_input)

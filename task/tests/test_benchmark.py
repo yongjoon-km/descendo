@@ -14,6 +14,7 @@ class SimpleModel(nn.Module):
 
 def test_benchmark():
     model = SimpleModel()
+    model.eval()
     
     benchmark = benchmark_model(model, input_shape=(1, 10), num_runs=5, warmup_runs=2)
     

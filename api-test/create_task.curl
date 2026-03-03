@@ -4,9 +4,12 @@ curl -X POST "http://localhost:8000/tasks" \
            "mode": "SYNC",
            "model_id": 1,
            "payload": {
-             "action": "process_model",
-             "file_id": "550e8400-e29b-41d4-a716-446655440000"
+             "input_shape": [1, 10],
+             "num_runs": 100,
+             "warmup_runs": 10
            },
-           "retry": 3,
-           "timeout": 10
+           "config": {
+               "retry": 3,
+               "timeout_sec": 10
+           }
          }'

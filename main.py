@@ -1,7 +1,6 @@
 import concurrent
 import json
 import time
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -9,53 +8,11 @@ from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from sqlalchemy import func
-from sqlmodel import SQLModel, Field as SQLField, Session, create_engine, select
+from sqlmodel import SQLModel, Session, create_engine, select
 
-# ===
-# Database Models
-# ===
-
-class ModelStatus(StrEnum):
-    PENDING_UPLOAD = 'PENDING_UPLOAD'
-    UPLOADING = 'UPLOADING'
-    UPLOADED = 'UPLOADED'
-
-
-
-class Model(SQLModel, table=True):
-    id: int | None = SQLField(primary_key=True)
-    name: str = SQLField()
-    framework: str = SQLField()
-    status: ModelStatus = SQLField()
-    file_path: str | None = SQLField()
-
-class TaskMode(StrEnum):
-    SYNC = 'SYNC'
-    ASYNC = 'ASYNC'
-
-
-class TaskStatus(StrEnum):
-    PENDING = 'PENDING'
-    RUNNING = 'RUNNING'
-    COMPLETED = 'COMPLETED'
-    FAILED = 'FAILED'
-    CANCELLED = 'CANCELLED'
-
-
-class TaskConfig(BaseModel):
-    retry: int
-    timeout_sec: int
-
-
-class Task(SQLModel, table=True):
-    id: int | None = SQLField(primary_key=True)
-    mode: TaskMode = SQLField()
-    status: TaskStatus = SQLField()
-    model_id: int = SQLField()
-    payload: str = SQLField()
-    config: str = SQLField()
-    result: str | None= SQLField()
-
+from models.model import Model, ModelStatus
+from models.task import Task, TaskConfig, TaskPayload, TaskStatus, TaskMode
+from task.executor import execute_task
 
 sqlite_file_name = "database.db"
 sqlite_url = f"sqlite:///{sqlite_file_name}"
@@ -71,7 +28,6 @@ def get_session():
         yield session
 
 SessionDep = Annotated[Session, Depends(get_session)]
-
 
 app = FastAPI()
 
@@ -192,33 +148,13 @@ def read_model(session: SessionDep, model_id: str):
 class TaskRequest(BaseModel):
     mode: TaskMode = Field(default=TaskMode.ASYNC, description="async / sync mode of executing the given task")
     model_id: int = Field(..., description="model id for running the task")
-    payload: dict[str, Any] = Field(..., description="data required for the given task")
-    retry: int = Field(default=3, ge=0, description="retry count if given task failed")
-    timeout_sec: int = Field(default=5, gt=0, description="timeout second for waiting the task is completed")
+    payload: TaskPayload = Field(..., description="data required for the given task")
+    config: TaskConfig = Field(..., description="config required for the given task")
 
 class TaskResponse(BaseModel):
     id: int
     status: TaskStatus
     result: Any | None = None
-
-
-def dummy_executor(session: Session, task_id: int):
-    task = session.get(Task, task_id)
-
-    if task is None:
-        raise Exception(f"task of {task_id} not found")
-
-    if task.status == TaskStatus.CANCELLED:
-        return
-
-    task.status = TaskStatus.RUNNING
-    session.commit()
-
-    time.sleep(3)
-
-    task.status = TaskStatus.COMPLETED
-    task.result = json.dumps({"message": "Task finished successfully!"})
-    session.commit()
 
 
 @app.post("/tasks", response_model=TaskResponse)
@@ -228,8 +164,8 @@ def create_task(session: SessionDep, request: TaskRequest):
         mode=request.mode,
         status=TaskStatus.PENDING,
         model_id=request.model_id,
-        payload=json.dumps(request.payload),
-        config=TaskConfig(retry=request.retry, timeout_sec=request.timeout_sec).model_dump_json(),
+        payload=request.payload.model_dump_json(),
+        config=request.config.model_dump_json(),
         result=None
     )
     
@@ -248,7 +184,7 @@ def create_task(session: SessionDep, request: TaskRequest):
                 # Execute the sync function inside a thread to enforce a timeout
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     # TODO: Change to real executor
-                    future = executor.submit(dummy_executor, session, task.id)
+                    future = executor.submit(execute_task, session, task.id)
                     
                     # This blocks until it finishes OR hits the timeout_sec
                     future.result(timeout=config.timeout_sec)
