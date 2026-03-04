@@ -184,7 +184,7 @@ def create_task(session: SessionDep, request: TaskRequest):
                 # Execute the sync function inside a thread to enforce a timeout
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     # TODO: Change to real executor
-                    future = executor.submit(execute_task, session, task.id)
+                    future = executor.submit(execute_task, session, task)
                     
                     # This blocks until it finishes OR hits the timeout_sec
                     future.result(timeout=config.timeout_sec)

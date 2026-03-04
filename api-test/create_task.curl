@@ -1,7 +1,7 @@
 curl -X POST "http://localhost:8000/tasks" \
      -H "Content-Type: application/json" \
      -d '{
-           "mode": "SYNC",
+           "mode": "ASYNC",
            "model_id": 1,
            "payload": {
              "input_shape": [1, 10],
