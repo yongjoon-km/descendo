@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    image: base_image
+    container_name: api_server
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./saved_models:/app/saved_models
+    restart: unless-stopped
+
+  engine:
+    image: base_image
+    container_name: task_engine
+    command: sh -c "sleep 30 && python -m engine.task_engine"
+    volumes:
+      - ./data:/app/data
+      - ./saved_models:/app/saved_models
+    depends_on:
+      - api
+    restart: unless-stopped

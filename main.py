@@ -1,6 +1,7 @@
 import concurrent
 import json
 import time
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -14,8 +15,10 @@ from models.model import Model, ModelStatus
 from models.task import Task, TaskConfig, TaskPayload, TaskStatus, TaskMode
 from task.executor import execute_task
 
+os.makedirs('data', mode=0o775, exist_ok=True)
+
 sqlite_file_name = "database.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+sqlite_url = f"sqlite:///./data/{sqlite_file_name}"
 
 connect_args = {"check_same_thread": False}
 engine = create_engine(sqlite_url, connect_args = connect_args)
